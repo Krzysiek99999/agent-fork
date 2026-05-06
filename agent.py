@@ -1918,6 +1918,7 @@ def solve(
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    test_fix_turns_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -2139,6 +2140,25 @@ def solve(
                 observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
                 logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
 
+                # V1 edge: failed verification -> dedicated test-repair turn.
+                # When the agent already produced a patch and just ran a
+                # verification command that failed, hand it back the failure
+                # tail and let it diagnose+fix once before any other refinement.
+                # This wires up the previously-dead MAX_TEST_FIX_TURNS path.
+                if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+                    patch_now = get_patch(repo)
+                    if patch_now.strip():
+                        failed_verif = _looks_like_failed_verification(observation, command)
+                        if failed_verif is not None:
+                            test_path, tail_output = failed_verif
+                            test_fix_turns_used += 1
+                            queue_refinement_turn(
+                                response_text,
+                                build_test_fix_prompt(test_path, tail_output),
+                                f"TEST_FIX_QUEUED:\n  command={command[:80]}\n  test={test_path}",
+                            )
+                            break  # re-enter outer loop with the repair prompt
+
                 if step >= 4 or command_index > 1:
                     patch = get_patch(repo)
                     if patch.strip() and _looks_like_successful_test_output(observation, command):
@@ -2271,6 +2291,34 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         return True
 
     return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
+def _looks_like_failed_verification(observation: str, command: str) -> Optional[Tuple[str, str]]:
+    """Detect a verification command (pytest/go test/etc) that ran and failed.
+
+    Returns (test_path_hint, output_tail) when the observation shows a failed
+    verification signal, else None. The test_path_hint is best-effort: a file
+    name from the command, or the trailing token, used to make the repair
+    prompt point at the actual failing test.
+    """
+    if not _looks_like_verification_command(command):
+        return None
+    lower = observation.lower()
+    exit_code = _extract_observation_exit_code(lower)
+    bad_markers = [" failed", " failures", " error", " errors", "traceback",
+                   "assertionerror", "syntaxerror", "exception"]
+    has_bad = any(marker in lower for marker in bad_markers)
+    failed = (exit_code is not None and exit_code != 0) or (exit_code is None and has_bad)
+    if not failed:
+        return None
+    tail = observation[-2400:] if len(observation) > 2400 else observation
+    path_match = re.search(r"\b([\w./-]+\.(?:py|js|ts|tsx|jsx|go|rs|java))\b", command)
+    if path_match:
+        test_path = path_match.group(1)
+    else:
+        toks = command.split()
+        test_path = toks[-1] if toks else "test"
+    return (test_path, tail)
 
 
 def _looks_like_verification_command(command: str) -> bool:
